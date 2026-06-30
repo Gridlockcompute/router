@@ -1,0 +1,29 @@
+{
+  "name": "gridlock-backend",
+  "version": "0.3.0",
+  "description": "Gridlock Router API Service",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "test:api": "tsx test/api.test.ts"
+  },
+  "dependencies": {
+    "@hono/node-server": "^1.14.4",
+    "@solana/spl-token": "^0.4.14",
+    "@solana/web3.js": "^1.98.4",
+    "@supabase/supabase-js": "^2.49.8",
+    "dotenv": "^16.5.0",
+    "hono": "^4.7.11",
+    "redis": "^4.7.1",
+    "ws": "^8.21.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.17.57",
+    "@types/ws": "^8.18.1",
+    "tsx": "^4.19.4",
+    "typescript": "^5.8.3"
+  }
+}
