@@ -23,9 +23,11 @@ Workers connect at `wss://api.grid-lock.tech/v1/ws`. The web dashboard at [https
 - **Prefill/Decode routing** — disaggregated worker roles with Redis KV warm-path
 - **Worker registry** — public register/heartbeat endpoints; AutoGate after 120s silence
 - **Wallet-owned API keys** — create, list, revoke via signed messages; hashed in Supabase
-- **Off-chain billing** — per-wallet $LOCK credits, usage metering, monthly invoices, on-chain deposit confirmation
-- **Passive staking** — stake info, deposit/unstake flows integrated with FeeCollector program
-- **Solana settlement** — optional on-chain job escrow, receipt commit, fee distribution
+- **Dual-rail economics** — **SOL** for payment (deposits → off-chain credits, worker payouts, staker rewards); **GRID** (Pump.fun Token-2022) for value (staking, buyback/burn, worker boost)
+- **Off-chain billing** — per-wallet credits, usage metering, monthly invoices; deposit via SOL transfer or legacy $LOCK token
+- **GRID staking** — self-custody pump rail via on-chain staking program, or legacy FeeCollector LOCK vaults
+- **Worker SOL payouts** — per-job earnings ledger, stake-based share boost, treasury-signed withdrawals
+- **Solana settlement** — optional on-chain job escrow, receipt commit, fee distribution (legacy LOCK rail)
 - **Live stream** — SSE at `/v1/live` for job events
 - **Redis cache** — prefix cache with in-memory fallback when Redis is unavailable
 
@@ -94,9 +96,15 @@ Used when no live WebSocket worker handles a job:
 | `SOLANA_RPC_URL` | devnet RPC | Solana JSON-RPC endpoint |
 | `SOLANA_CLUSTER` | `devnet` | Explorer cluster (`devnet` \| `mainnet-beta`) |
 | `ROUTER_KEYPAIR_PATH` | `~/.config/solana/id.json` | Router signing keypair |
-| `SOLANA_SETTLEMENT_ENABLED` | `false` | Enable on-chain job settlement |
-| `LOCK_MINT` | — | LOCK Token-2022 mint |
-| `FEE_VAULT`, `STAKER_POOL`, `WORKER_PAYOUT`, `TREASURY`, `BURN_VAULT` | — | Fee vault addresses |
+| `SOLANA_SETTLEMENT_ENABLED` | `false` | Enable on-chain job settlement (legacy LOCK rail) |
+| `GRIDLOCK_BILLING_RAIL` | `sol` | Payment rail: `sol` or `lock` |
+| `GRIDLOCK_LAMPORTS_PER_CREDIT` | `1000000` | Lamports per 1 credit when `billingRail=sol` (1M = 0.001 SOL) |
+| `PUMP_TOKEN_MINT` | — | GRID (Pump.fun) mint for pump staking rail |
+| `PUMP_TOKEN_SYMBOL` | `GRID` | Display symbol for stake UI |
+| `GRIDLOCK_STAKING_RAIL` | `pump` | Staking rail: `pump` or `lock` |
+| `GRIDLOCK_STAKING_PROGRAM_ID` | c0mpute devnet default | On-chain staking program for pump rail |
+| `LOCK_MINT` | — | LOCK Token-2022 mint (legacy lock rail only) |
+| `FEE_VAULT`, `STAKER_POOL`, `WORKER_PAYOUT`, `TREASURY`, `BURN_VAULT` | — | Fee vault addresses (lock rail) |
 | `CUSTOMER_WALLET` | — | Router LOCK ATA for job escrow |
 | `DEFAULT_WORKER_STAKE` | — | Default worker penalty stake ATA |
 
@@ -110,7 +118,11 @@ Program IDs (devnet) are hardcoded in `src/config.ts` — see [programs repo](ht
 | `SUPABASE_PUBLISHABLE_KEY` | Publishable key (if used by clients) |
 | `SUPABASE_KEY` | Service role key |
 
-Run SQL migrations in order from `migrations/` (`001_initial.sql` through `007_stake.sql`).
+Run SQL migrations in order from `migrations/` (`001_initial.sql` through `008_worker_payouts.sql`):
+
+```bash
+./scripts/run-migration.sh migrations/008_worker_payouts.sql
+```
 
 ### Auth and billing
 
@@ -118,13 +130,17 @@ Run SQL migrations in order from `migrations/` (`001_initial.sql` through `007_s
 |----------|---------|-------------|
 | `API_KEYS` | — | Comma-separated bootstrap API keys |
 | `GRIDLOCK_INSECURE_KEY_MANAGEMENT` | `false` | Dev: trust `X-Gridlock-Wallet` without signature |
-| `GRIDLOCK_BILLING_ENABLED` | `true` | Deduct off-chain $LOCK credits on chat |
-| `GRIDLOCK_STARTING_CREDIT_LOCK` | `10` | Credits for new wallets |
+| `GRIDLOCK_BILLING_ENABLED` | `true` | Deduct off-chain credits on chat |
+| `GRIDLOCK_STARTING_CREDIT_LOCK` | `10` | Starting credits for new wallets |
 | `GRIDLOCK_BILLING_DEV_TOPUP` | `true` | Dev: enable test top-up endpoint |
-| `GRIDLOCK_MIN_DEPOSIT_LOCK` | `1` | Minimum on-chain deposit |
-| `GRIDLOCK_STAKING_ENABLED` | `true` | Passive staking endpoints |
+| `GRIDLOCK_MIN_DEPOSIT_LOCK` | `1` | Minimum deposit (LOCK rail) |
+| `GRIDLOCK_STAKING_ENABLED` | `true` | Staking endpoints |
 | `GRIDLOCK_MIN_STAKE_LOCK` | `1` | Minimum stake amount |
 | `GRIDLOCK_INVOICE_CRON` | `true` | Auto-generate monthly invoices |
+| `TREASURY_WALLET_KEY` | router keypair | Signer for worker SOL payouts |
+| `GRIDLOCK_WORKER_PAYOUTS_ENABLED` | `true` | Worker earnings + SOL withdrawal API |
+| `GRIDLOCK_WORKER_MIN_WITHDRAWAL` | `0.01` | Minimum withdrawal (credits) |
+| `GRIDLOCK_WORKER_BOOST_MIN_STAKE` | `5000` | GRID stake threshold for payout boost |
 | `WATCHER_SAMPLE_RATE` | `0.05` | SLA watcher sampling rate |
 
 See `.env.example` for the full list with comments.
@@ -204,10 +220,11 @@ router/
 │   ├── config.ts          # Env + program IDs + fee tables
 │   ├── routes/            # chat, workers, jobs, billing, stake, keys, auth
 │   ├── ws/                # WebSocket hub
-│   ├── billing/           # credits, invoices, deposits
-│   ├── staking/           # deposit, unstake, reads
+│   ├── billing/           # credits, invoices, sol-deposits, worker-earnings, sol-payout
+│   ├── staking/           # deposit, unstake, pump-staking, worker-boost, reads
 │   └── solana-settlement.ts
-├── migrations/            # Supabase SQL
+├── migrations/            # Supabase SQL (001–008)
+├── scripts/               # run-migration.sh
 ├── test/
 ├── preset/setup.md        # Example dev preset
 ├── Dockerfile
@@ -244,8 +261,12 @@ Customer / Console
 | [programs](https://github.com/Gridlockcompute/programs) | Solana Anchor programs — escrow, SLA, fees |
 | [worker-desktop](https://github.com/Gridlockcompute/worker-desktop) | Electron GPU worker |
 | [worker-cli](https://github.com/Gridlockcompute/worker-cli) | Headless CLI worker |
+| [gridlock-web](https://github.com/ReactOnAuth/gridlock-web) | Next.js console, staking, worker dashboard |
+| [gridlockcompute](https://github.com/Gridlockcompute/gridlockcompute) | Org profile, keeper scripts, migration docs |
 
 **Website:** [https://grid-lock.tech](https://grid-lock.tech) · **API reference:** [https://grid-lock.tech/docs](https://grid-lock.tech/docs)
+
+See [docs/PLAN-SOL-PUMP.md](https://github.com/Gridlockcompute/gridlockcompute/blob/main/docs/PLAN-SOL-PUMP.md) for the SOL + GRID migration architecture.
 
 ## License
 
