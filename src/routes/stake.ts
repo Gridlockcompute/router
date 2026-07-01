@@ -54,7 +54,13 @@ stakeRoutes.get("/v1/stake/deposit/info", async (c) => {
       return c.json({ error: "Invalid wallet address" }, 400);
     }
     const info = buildStakeDepositInfo(walletQuery);
-    if (!info) return c.json({ error: "Staking not configured (LOCK_MINT)" }, 503);
+    if (!info) {
+      const hint =
+        config.stakingRail === "pump"
+          ? "Staking not configured (PUMP_TOKEN_MINT)"
+          : "Staking not configured (LOCK_MINT)";
+      return c.json({ error: hint }, 503);
+    }
     return c.json(info);
   }
 
@@ -62,7 +68,13 @@ stakeRoutes.get("/v1/stake/deposit/info", async (c) => {
   if ("error" in auth) return c.json({ error: auth.error }, 401);
 
   const info = buildStakeDepositInfo(auth.wallet);
-  if (!info) return c.json({ error: "Staking not configured (LOCK_MINT)" }, 503);
+  if (!info) {
+    const hint =
+      config.stakingRail === "pump"
+        ? "Staking not configured (PUMP_TOKEN_MINT)"
+        : "Staking not configured (LOCK_MINT)";
+    return c.json({ error: hint }, 503);
+  }
   return c.json(info);
 });
 

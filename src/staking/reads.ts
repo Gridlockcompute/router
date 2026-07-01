@@ -15,24 +15,39 @@ import {
   estimatedDailyApyLock,
   multiplierForStake,
 } from "./constants.js";
+import { buildPumpStakeAddresses, derivePumpStakeVault } from "./pump-staking.js";
+import { getWorkerBoostInfo } from "./worker-boost.js";
+
+export function activeStakeMint(): string | null {
+  if (config.stakingRail === "pump") return config.pumpTokenMint || null;
+  return config.lockMint || null;
+}
+
+export function activeStakeDecimals(): number {
+  if (config.stakingRail === "pump") return config.pumpTokenDecimals;
+  return LOCK_DECIMALS;
+}
 
 export function isStakingDepositEnabled(): boolean {
-  return config.stakingEnabled && Boolean(config.lockMint);
+  if (!config.stakingEnabled) return false;
+  if (config.stakingRail === "pump") return Boolean(config.pumpTokenMint);
+  return Boolean(config.lockMint);
 }
 
 function connection(): Connection {
   return new Connection(config.solanaRpcUrl, "confirmed");
 }
 
-export async function readLockTokenBalance(
+export async function readTokenBalance(
   accountAddress: string,
+  decimals = LOCK_DECIMALS,
 ): Promise<{ balance_lock: number; exists: boolean }> {
   const pubkey = tryPublicKey(accountAddress);
   if (!pubkey) return { balance_lock: 0, exists: false };
   try {
     const acct = await getAccount(connection(), pubkey, "confirmed", TOKEN_2022_PROGRAM_ID);
     return {
-      balance_lock: Number(acct.amount) / 10 ** LOCK_DECIMALS,
+      balance_lock: Number(acct.amount) / 10 ** decimals,
       exists: true,
     };
   } catch {
@@ -71,12 +86,18 @@ export async function buildStakeInfo() {
     .reduce((sum, j) => sum + (j.penalty_paid ?? 0), 0);
 
   const [stakerPool, feeVault] = await Promise.all([
-    config.stakerPool ? readLockTokenBalance(config.stakerPool) : Promise.resolve({ balance_lock: 0, exists: false }),
-    config.feeVault ? readLockTokenBalance(config.feeVault) : Promise.resolve({ balance_lock: 0, exists: false }),
+    config.stakerPool ? readTokenBalance(config.stakerPool) : Promise.resolve({ balance_lock: 0, exists: false }),
+    config.feeVault ? readTokenBalance(config.feeVault) : Promise.resolve({ balance_lock: 0, exists: false }),
   ]);
 
   return {
-    lock_mint: config.lockMint || null,
+    staking_rail: config.stakingRail,
+    stake_mint: activeStakeMint(),
+    lock_mint: activeStakeMint(),
+    token_symbol: config.stakingRail === "pump" ? config.pumpTokenSymbol : "LOCK",
+    token_decimals: activeStakeDecimals(),
+    staking_program_id: config.stakingRail === "pump" ? config.stakingProgramId : null,
+    instant_unstake: config.stakingRail === "pump",
     staker_pool_address: config.stakerPool || null,
     staker_pool_lock: stakerPool.balance_lock,
     staker_pool_exists: stakerPool.exists,
@@ -94,8 +115,8 @@ export async function buildStakeInfo() {
     target_apy_pct: TARGET_APY_BPS / 100,
     epoch_days: EPOCH_DAYS,
     staking_deposit_enabled: isStakingDepositEnabled(),
-    staking_claim_enabled: config.stakingClaimEnabled,
-    unstake_cooldown_days: Math.round(config.stakeCooldownSec / 86400),
+    staking_claim_enabled: config.stakingRail === "pump" ? true : config.stakingClaimEnabled,
+    unstake_cooldown_days: config.stakingRail === "pump" ? 0 : Math.round(config.stakeCooldownSec / 86400),
     min_stake_lock: config.minStakeLock,
     solana_cluster: config.solanaCluster,
     solana_settlement_enabled: config.solanaSettlementEnabled,
@@ -103,19 +124,38 @@ export async function buildStakeInfo() {
 }
 
 export async function buildStakePosition(wallet: string) {
-  const vault = deriveStakerVaultAddresses(wallet);
-  const vaultBalance = vault
-    ? await readLockTokenBalance(vault.vault_ata)
-    : { balance_lock: 0, exists: false };
+  const decimals = activeStakeDecimals();
+  let vault: { authority: string; vault_ata: string } | null = null;
+  let vaultBalance = { balance_lock: 0, exists: false };
+
+  if (config.stakingRail === "pump") {
+    const pumpVault = derivePumpStakeVault(wallet);
+    const addrs = buildPumpStakeAddresses(wallet);
+    if (pumpVault && addrs) {
+      vault = { authority: addrs.stake_authority, vault_ata: addrs.stake_vault_ata };
+      vaultBalance = await readTokenBalance(pumpVault.toBase58(), decimals);
+    }
+  } else {
+    vault = deriveStakerVaultAddresses(wallet);
+    vaultBalance = vault
+      ? await readTokenBalance(vault.vault_ata, decimals)
+      : { balance_lock: 0, exists: false };
+  }
 
   const worker = workersRegistry.find((w) => w.address === wallet);
   const stakedLock = vaultBalance.balance_lock;
-  const pendingRow = await dbGetPendingUnstakeForWallet(wallet);
+  const pendingRow =
+    config.stakingRail === "pump" ? null : await dbGetPendingUnstakeForWallet(wallet);
   const pendingUnstake = pendingRow?.amount_lock ?? 0;
   const tier = multiplierForStake(stakedLock);
+  const workerBoost = await getWorkerBoostInfo(wallet);
 
   return {
     wallet,
+    staking_rail: config.stakingRail,
+    token_symbol: config.stakingRail === "pump" ? config.pumpTokenSymbol : "LOCK",
+    token_decimals: decimals,
+    instant_unstake: config.stakingRail === "pump",
     staked_lock: stakedLock,
     staker_vault_authority: vault?.authority ?? null,
     staker_vault_ata: vault?.vault_ata ?? null,
@@ -137,6 +177,7 @@ export async function buildStakePosition(wallet: string) {
       max_lock: tier.max,
     },
     estimated_daily_apy_lock: estimatedDailyApyLock(stakedLock),
+    worker_boost: workerBoost,
     worker: worker
       ? {
           registered: true,
@@ -147,6 +188,6 @@ export async function buildStakePosition(wallet: string) {
         }
       : { registered: false },
     staking_deposit_enabled: isStakingDepositEnabled(),
-    staking_claim_enabled: config.stakingClaimEnabled,
+    staking_claim_enabled: config.stakingRail === "pump" ? true : config.stakingClaimEnabled,
   };
 }

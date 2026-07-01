@@ -1,4 +1,11 @@
 import { Hono } from "hono";
+import { resolveWallet, resolveWalletRead } from "../api-keys/resolve-wallet.js";
+import {
+  getWorkerEarningsSummary,
+  listWorkerPayoutHistory,
+  withdrawWorkerEarnings,
+} from "../billing/worker-earnings.js";
+import { solscanTxUrl } from "../billing/invoices.js";
 import { config } from "../config.js";
 import { dbUpsertWorker } from "../db.js";
 import { anchorRegisterWorker } from "../solana.js";
@@ -145,4 +152,77 @@ workerRoutes.patch("/v1/workers/:address/confidential", async (c) => {
   worker.is_confidential = body.enabled;
   void dbUpsertWorker(worker);
   return c.json({ ok: true, is_confidential: worker.is_confidential });
+});
+
+const BASE58_REGEX = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
+
+workerRoutes.get("/v1/workers/:address/earnings", async (c) => {
+  const address = c.req.param("address");
+  const auth = resolveWalletRead(c, ["worker", "earnings", "session"]);
+  if ("error" in auth) return c.json({ error: auth.error }, 401);
+  if (auth.wallet !== address) {
+    return c.json({ error: "Wallet mismatch" }, 403);
+  }
+
+  const worker = workersRegistry.find((w) => w.address === address);
+  if (!worker) return c.json({ error: `Worker ${address} not found` }, 404);
+
+  const summary = await getWorkerEarningsSummary(address);
+  const payouts = await listWorkerPayoutHistory(address, 20);
+  return c.json({
+    ...summary,
+    recent_payouts: payouts.map((p) => ({
+      ...p,
+      explorer_url: p.tx_signature ? solscanTxUrl(p.tx_signature) : null,
+    })),
+    solana_cluster: config.solanaCluster,
+  });
+});
+
+workerRoutes.post("/v1/workers/payout", async (c) => {
+  const auth = resolveWallet(c, "payout");
+  if ("error" in auth) return c.json({ error: auth.error }, 401);
+
+  const worker = workersRegistry.find((w) => w.address === auth.wallet);
+  if (!worker) return c.json({ error: "Register as a worker before withdrawing" }, 404);
+
+  const body = (await c.req.json()) as { address?: string; amount?: number };
+  const dest = body.address?.trim();
+  const amount = Number(body.amount);
+  if (!dest || !BASE58_REGEX.test(dest)) {
+    return c.json({ error: "Invalid Solana wallet address" }, 400);
+  }
+  if (!Number.isFinite(amount) || amount <= 0) {
+    return c.json({ error: "Invalid amount" }, 400);
+  }
+  if (amount < config.workerMinWithdrawalCredits) {
+    return c.json(
+      { error: `Minimum withdrawal is ${config.workerMinWithdrawalCredits} credits` },
+      400,
+    );
+  }
+
+  try {
+    const result = await withdrawWorkerEarnings(auth.wallet, dest, amount);
+    if (!result.ok) {
+      const map = {
+        below_min: { error: `Minimum withdrawal is ${config.workerMinWithdrawalCredits} credits`, status: 400 },
+        insufficient: { error: "Insufficient pending balance", status: 400 },
+        in_flight: { error: "You already have a withdrawal in progress", status: 409 },
+        disabled: { error: "Worker payouts are temporarily unavailable", status: 503 },
+        not_worker: { error: "Worker not registered", status: 404 },
+      } as const;
+      const r = map[result.reason];
+      return c.json({ error: r.error }, r.status);
+    }
+    return c.json({
+      ok: true,
+      amount_credits: result.amount_credits,
+      amount_sol: result.amount_sol,
+      tx_signature: result.tx_signature,
+      explorer_url: solscanTxUrl(result.tx_signature),
+    });
+  } catch {
+    return c.json({ error: "Transfer failed — your balance is unchanged" }, 500);
+  }
 });

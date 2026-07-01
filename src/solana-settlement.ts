@@ -19,6 +19,9 @@ import type { WorkerRecord } from "./types.js";
 
 const TOKEN_2022 = new PublicKey("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb");
 
+const CHALLENGE_POLL_MS = 400;
+const CHALLENGE_WAIT_MAX_MS = 30_000;
+
 function anchorDiscriminator(name: string): Buffer {
   return createHash("sha256").update(`global:${name}`).digest().subarray(0, 8);
 }
@@ -71,6 +74,60 @@ function derivePda(programId: string, seeds: Buffer[]): PublicKey {
 function lockAccountsReady(): boolean {
   const { lockMint, feeVault, customerWallet } = config;
   return Boolean(lockMint && feeVault && customerWallet);
+}
+
+function finalizeReceiptInstruction(jobId: string, caller: PublicKey): TransactionInstruction {
+  const id = jobIdBytes(jobId);
+  const receipt = derivePda(PROGRAM_IDS.slaRegistry, [Buffer.from("receipt"), id]);
+  return new TransactionInstruction({
+    programId: new PublicKey(PROGRAM_IDS.slaRegistry),
+    keys: [
+      { pubkey: caller, isSigner: true, isWritable: false },
+      { pubkey: receipt, isSigner: false, isWritable: true },
+    ],
+    data: anchorDiscriminator("finalize_unchallenged"),
+  });
+}
+
+/** Simulate finalize_unchallenged; succeeds only once the on-chain challenge window has closed. */
+async function simulateFinalizeReceipt(jobId: string): Promise<boolean> {
+  const kp = loadKeypair();
+  if (!kp) return false;
+
+  const rpc = await solanaRpc<{ value: { blockhash: string } }>("getLatestBlockhash", [
+    { commitment: "confirmed" },
+  ]);
+  const blockhash = rpc.result?.value?.blockhash;
+  if (!blockhash) return false;
+
+  const msg = new TransactionMessage({
+    payerKey: kp.publicKey,
+    recentBlockhash: blockhash,
+    instructions: [finalizeReceiptInstruction(jobId, kp.publicKey)],
+  }).compileToV0Message();
+  const tx = new VersionedTransaction(msg);
+  tx.sign([kp]);
+
+  const result = await solanaRpc<{ value: { err: unknown } | null }>("simulateTransaction", [
+    Buffer.from(tx.serialize()).toString("base64"),
+    { encoding: "base64", commitment: "confirmed", sigVerify: true },
+  ]);
+  if (result.error) return false;
+  return result.result?.value?.err == null;
+}
+
+/** Poll until finalize_unchallenged simulation passes (uses the program's own clock check). */
+async function waitForChallengeWindow(jobId: string): Promise<boolean> {
+  const start = Date.now();
+  while (Date.now() - start < CHALLENGE_WAIT_MAX_MS) {
+    if (await simulateFinalizeReceipt(jobId)) {
+      console.log(`[solana] challenge window elapsed (${Date.now() - start}ms)`);
+      return true;
+    }
+    await new Promise((r) => setTimeout(r, CHALLENGE_POLL_MS));
+  }
+  console.log(`[solana] challenge window wait timeout (${CHALLENGE_WAIT_MAX_MS}ms)`);
+  return false;
 }
 
 async function sendIx(
@@ -249,13 +306,8 @@ export async function anchorFinalizeReceipt(jobId: string): Promise<boolean> {
   const kp = loadKeypair();
   if (!kp) return false;
 
-  const id = jobIdBytes(jobId);
-  const receipt = derivePda(PROGRAM_IDS.slaRegistry, [Buffer.from("receipt"), id]);
-  const data = anchorDiscriminator("finalize_unchallenged");
-  return (await sendAndConfirm(PROGRAM_IDS.slaRegistry, data, [
-    { pubkey: kp.publicKey, isSigner: true, isWritable: false },
-    { pubkey: receipt, isSigner: false, isWritable: true },
-  ])) !== null;
+  const ix = finalizeReceiptInstruction(jobId, kp.publicKey);
+  return (await sendAndConfirm(PROGRAM_IDS.slaRegistry, ix.data, ix.keys)) !== null;
 }
 
 function workerStakeAccount(worker: WorkerRecord): PublicKey | null {
@@ -292,7 +344,7 @@ export async function anchorSettleOrPenalizeWithSig(
 
   const data = Buffer.concat([anchorDiscriminator("settle_or_penalize"), id]);
   return sendAndConfirm(PROGRAM_IDS.slaEnforcer, data, [
-    { pubkey: enforcer, isSigner: false, isWritable: false },
+    { pubkey: enforcer, isSigner: false, isWritable: true },
     { pubkey: receipt, isSigner: false, isWritable: true },
     { pubkey: job, isSigner: false, isWritable: true },
     { pubkey: stake, isSigner: false, isWritable: true },
@@ -346,7 +398,10 @@ export async function runOnChainSettlement(
     return null;
   }
 
-  await new Promise((r) => setTimeout(r, 2500));
+  if (!(await waitForChallengeWindow(jobId))) {
+    console.log("[solana] settlement aborted: challenge window still open");
+    return null;
+  }
 
   if (!(await anchorFinalizeReceipt(jobId))) {
     console.log("[solana] settlement aborted: finalize_unchallenged failed");

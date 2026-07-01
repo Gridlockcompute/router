@@ -17,6 +17,10 @@ export const config = {
   routerKeypairPath: expandHome(process.env.ROUTER_KEYPAIR_PATH ?? "~/.config/solana/id.json"),
   /** Off by default — requires LOCK mint, token vaults, and matching Anchor ix encoding. */
   solanaSettlementEnabled: process.env.SOLANA_SETTLEMENT_ENABLED === "true",
+  /** Payment rail: sol (SOL deposits → credits) or lock (legacy $LOCK token deposits). */
+  billingRail: (process.env.GRIDLOCK_BILLING_RAIL ?? "sol") as "sol" | "lock",
+  /** Lamports per 1 billing credit when billingRail=sol (default 0.001 SOL). */
+  lamportsPerCredit: Number(process.env.GRIDLOCK_LAMPORTS_PER_CREDIT ?? "1000000"),
   lockMint: process.env.LOCK_MINT ?? "",
   feeVault: process.env.FEE_VAULT ?? "",
   stakerPool: process.env.STAKER_POOL ?? "",
@@ -50,6 +54,14 @@ export const config = {
   stakingClaimEnabled: process.env.GRIDLOCK_STAKING_CLAIM_ENABLED === "true",
   /** Record API key owner on job escrow metadata for on-chain correlation. */
   perCustomerEscrowTracking: process.env.GRIDLOCK_PER_CUSTOMER_ESCROW !== "false",
+  /** Pump.fun value token (Phase B staking). */
+  pumpTokenMint: process.env.PUMP_TOKEN_MINT ?? "",
+  pumpTokenSymbol: process.env.PUMP_TOKEN_SYMBOL ?? "GRID",
+  pumpTokenDecimals: Number(process.env.PUMP_TOKEN_DECIMALS ?? "6"),
+  /** On-chain staking program (c0mpute-compatible devnet default). */
+  stakingProgramId: process.env.GRIDLOCK_STAKING_PROGRAM_ID ?? "BU3JcQJBsFZwNV2DHSPeu3hKLsfarLS2AU5RuVhJrYKM",
+  /** Staking rail: pump (self-custody program) or lock (FeeCollector vault). */
+  stakingRail: (process.env.GRIDLOCK_STAKING_RAIL ?? (process.env.PUMP_TOKEN_MINT ? "pump" : "lock")) as "pump" | "lock",
   /** Optional secret for POST /v1/billing/invoices/close-all (external cron). */
   invoiceCronSecret: process.env.GRIDLOCK_INVOICE_CRON_SECRET ?? "",
   /** HMAC secret for wallet console session tokens (24h read access). */
@@ -57,6 +69,18 @@ export const config = {
     process.env.GRIDLOCK_WALLET_SESSION_SECRET
     ?? process.env.SUPABASE_KEY
     ?? "gridlock-dev-wallet-session",
+  /** Treasury key for worker SOL payouts (path, JSON array, or base58). */
+  treasuryWalletKey:
+    process.env.TREASURY_WALLET_KEY
+    ?? process.env.ROUTER_KEYPAIR_PATH
+    ?? "~/.config/solana/id.json",
+  /** Worker SOL withdrawals (Phase D). */
+  workerPayoutsEnabled: process.env.GRIDLOCK_WORKER_PAYOUTS_ENABLED !== "false",
+  workerMinWithdrawalCredits: Number(process.env.GRIDLOCK_WORKER_MIN_WITHDRAWAL ?? "0.01"),
+  /** Seconds staked before worker boost applies (0 = instant for dev). */
+  workerStakeMatureSec: Number(process.env.GRIDLOCK_WORKER_STAKE_MATURE_SEC ?? "60"),
+  workerBoostMinStake: Number(process.env.GRIDLOCK_WORKER_BOOST_MIN_STAKE ?? "5000"),
+  workerMaxShareBps: Number(process.env.GRIDLOCK_WORKER_MAX_SHARE_BPS ?? "6000"),
   apiKeys: new Set(
     (process.env.API_KEYS ?? "")
       .split(",")

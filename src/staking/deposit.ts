@@ -7,23 +7,49 @@ import { config } from "../config.js";
 import { tryPublicKey } from "../solana.js";
 import { LOCK_DECIMALS } from "./constants.js";
 import { deriveStakerVaultAddresses } from "./reads.js";
+import { buildPumpStakeAddresses } from "./pump-staking.js";
 
-export function lockBaseUnitsToAmount(baseUnits: bigint): number {
-  return Math.round((Number(baseUnits) / 10 ** LOCK_DECIMALS) * 10000) / 10000;
+export function lockBaseUnitsToAmount(baseUnits: bigint, decimals = LOCK_DECIMALS): number {
+  return Math.round((Number(baseUnits) / 10 ** decimals) * 10000) / 10000;
 }
 
 export interface StakeDepositInfo {
+  staking_rail: "pump" | "lock";
   lock_mint: string;
+  stake_mint: string;
+  token_symbol: string;
   staker_vault_authority: string;
   staker_vault_ata: string;
   customer_ata: string;
+  staking_program_id?: string;
   decimals: number;
   min_stake_lock: number;
   cooldown_days: number;
+  instant_unstake: boolean;
   cluster: string;
 }
 
 export function buildStakeDepositInfo(ownerWallet: string): StakeDepositInfo | null {
+  if (config.stakingRail === "pump") {
+    const addrs = buildPumpStakeAddresses(ownerWallet);
+    if (!addrs) return null;
+    return {
+      staking_rail: "pump",
+      lock_mint: addrs.stake_mint,
+      stake_mint: addrs.stake_mint,
+      token_symbol: addrs.token_symbol,
+      staker_vault_authority: addrs.stake_authority,
+      staker_vault_ata: addrs.stake_vault_ata,
+      customer_ata: addrs.owner_ata,
+      staking_program_id: addrs.staking_program_id,
+      decimals: addrs.token_decimals,
+      min_stake_lock: config.minStakeLock,
+      cooldown_days: 0,
+      instant_unstake: true,
+      cluster: config.solanaCluster,
+    };
+  }
+
   const vault = deriveStakerVaultAddresses(ownerWallet);
   const owner = tryPublicKey(ownerWallet);
   if (!vault || !owner || !config.lockMint) return null;
@@ -38,13 +64,17 @@ export function buildStakeDepositInfo(ownerWallet: string): StakeDepositInfo | n
       TOKEN_2022_PROGRAM_ID,
     );
     return {
+      staking_rail: "lock",
       lock_mint: config.lockMint,
+      stake_mint: config.lockMint,
+      token_symbol: "LOCK",
       staker_vault_authority: vault.authority,
       staker_vault_ata: vault.vault_ata,
       customer_ata: customerAta.toBase58(),
       decimals: LOCK_DECIMALS,
       min_stake_lock: config.minStakeLock,
       cooldown_days: Math.round(config.stakeCooldownSec / 86400),
+      instant_unstake: false,
       cluster: config.solanaCluster,
     };
   } catch {

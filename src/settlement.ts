@@ -1,5 +1,6 @@
 import { config, PENALTY_MULT } from "./config.js";
 import { creditSlaPenalty } from "./billing/credits.js";
+import { recordWorkerEarning } from "./billing/worker-earnings.js";
 import { dbInsertJob } from "./db.js";
 import { addLockBurned, broadcastEvent, jobsStore } from "./state.js";
 import type { WorkerRecord } from "./types.js";
@@ -23,11 +24,8 @@ export async function settleJob(
 
   console.log(`[receipt] ${jobId.slice(0, 12)} tier=${slaTier} ttft=${ttftMs}ms ${slaMet ? "MET" : "MISS"}`);
 
-  addLockBurned(fee * 0.1);
-
   const job = jobsStore.find((j) => j.id === jobId);
   if (job) {
-    job.status = "settled";
     if (!slaMet && penalty != null) job.penalty_paid = Math.round(penalty * 10000) / 10000;
 
     if (config.solanaSettlementEnabled) {
@@ -42,7 +40,24 @@ export async function settleJob(
         fee,
         attestationHash,
       );
-      if (tx) job.settlement_tx = tx;
+      if (!tx) {
+        job.status = "settlement_failed";
+        await dbInsertJob(job);
+        console.log(`[solana] job ${jobId.slice(0, 12)} marked settlement_failed`);
+        broadcastEvent({
+          type: "job",
+          id: jobId,
+          sla_tier: slaTier,
+          ttft_ms: ttftMs,
+          tpot_ms: tpotMs,
+          sla_met: slaMet,
+          penalty,
+          worker: worker.address.slice(0, 8),
+          ts: Date.now() / 1000,
+        });
+        return;
+      }
+      job.settlement_tx = tx;
     } else if (!settlementSkipLogged) {
       settlementSkipLogged = true;
       console.log(
@@ -51,6 +66,8 @@ export async function settleJob(
       );
     }
 
+    job.status = "settled";
+    addLockBurned(fee * 0.1);
     await dbInsertJob(job);
 
     if (!slaMet && penalty != null && job.owner_wallet) {
@@ -59,6 +76,9 @@ export async function settleJob(
   }
 
   await onWorkerJobSettled(worker);
+  if (job?.status === "settled") {
+    await recordWorkerEarning(worker.address, jobId, fee);
+  }
 
   broadcastEvent({
     type: "job",

@@ -5,6 +5,7 @@ import {
 } from "@solana/spl-token";
 import { config } from "../config.js";
 import { tryPublicKey } from "../solana.js";
+import { buildSolDepositInfo } from "./sol-deposits.js";
 
 const LOCK_DECIMALS = 9;
 
@@ -42,7 +43,8 @@ export function lockBaseUnitsToAmount(baseUnits: bigint): number {
   return Math.round((Number(baseUnits) / 10 ** LOCK_DECIMALS) * 10000) / 10000;
 }
 
-export interface DepositInfo {
+export interface LockDepositInfo {
+  rail: "lock";
   lock_mint: string;
   deposit_vault: string;
   treasury_owner: string;
@@ -52,12 +54,19 @@ export interface DepositInfo {
   cluster: string;
 }
 
+export type DepositInfo = LockDepositInfo | NonNullable<ReturnType<typeof buildSolDepositInfo>>;
+
 export function buildDepositInfo(ownerWallet: string): DepositInfo | null {
+  if (config.billingRail === "sol") {
+    return buildSolDepositInfo();
+  }
+
   const vault = getBillingDepositVault();
   const customerAta = getCustomerLockAta(ownerWallet);
   if (!vault || !customerAta || !config.lockMint || !config.treasury) return null;
 
   return {
+    rail: "lock",
     lock_mint: config.lockMint,
     deposit_vault: vault.toBase58(),
     treasury_owner: config.treasury,

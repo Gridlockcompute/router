@@ -810,3 +810,254 @@ export async function dbMarkUnstakeClaimed(id: string, claimTx: string): Promise
     return false;
   }
 }
+
+// ─── Worker earnings (Phase D) ────────────────────────────────────────────────
+
+export async function dbInsertWorkerEarning(row: {
+  worker_wallet: string;
+  job_id: string;
+  fee_credits: number;
+  share_bps: number;
+  earning_credits: number;
+  boosted: boolean;
+}): Promise<boolean> {
+  const sb = getClient();
+  if (!sb) return false;
+  try {
+    const { error } = await sb.from("worker_earnings").insert({
+      worker_wallet: row.worker_wallet,
+      job_id: row.job_id,
+      fee_credits: row.fee_credits,
+      share_bps: row.share_bps,
+      earning_credits: row.earning_credits,
+      boosted: row.boosted,
+    });
+    if (error) {
+      if (error.code === "23505") return false;
+      throw error;
+    }
+    return true;
+  } catch (error) {
+    console.log(`[supabase] insert_worker_earning failed: ${formatSupabaseError(error)}`);
+    return false;
+  }
+}
+
+export async function dbGetOldestStakeDepositAgeSec(wallet: string): Promise<number | null> {
+  const sb = getClient();
+  if (!sb) return null;
+  try {
+    const { data, error } = await sb
+      .from("stake_deposits")
+      .select("confirmed_at")
+      .eq("owner_wallet", wallet)
+      .order("confirmed_at", { ascending: true })
+      .limit(1)
+      .maybeSingle();
+    if (error) throw error;
+    if (!data?.confirmed_at) return null;
+    const ts = new Date(String(data.confirmed_at)).getTime();
+    return Math.max(0, (Date.now() - ts) / 1000);
+  } catch (error) {
+    console.log(`[supabase] oldest_stake_deposit failed: ${formatSupabaseError(error)}`);
+    return null;
+  }
+}
+
+export async function dbGetWorkerEarningsSummary(wallet: string): Promise<{
+  worker_wallet: string;
+  pending_credits: number;
+  pending_sol: number;
+  total_earned_credits: number;
+  total_paid_credits: number;
+  today_credits: number;
+  week_credits: number;
+  payouts_enabled: boolean;
+  min_withdrawal_credits: number;
+  min_withdrawal_sol: number;
+}> {
+  const { config } = await import("./config.js");
+  const { creditsToSol } = await import("./billing/pricing.js");
+  const { isTreasuryPayoutConfigured } = await import("./billing/sol-payout.js");
+
+  const sb = getClient();
+  const zero = {
+    worker_wallet: wallet,
+    pending_credits: 0,
+    pending_sol: 0,
+    total_earned_credits: 0,
+    total_paid_credits: 0,
+    today_credits: 0,
+    week_credits: 0,
+    payouts_enabled: config.workerPayoutsEnabled && isTreasuryPayoutConfigured(),
+    min_withdrawal_credits: config.workerMinWithdrawalCredits,
+    min_withdrawal_sol: creditsToSol(config.workerMinWithdrawalCredits),
+  };
+  if (!sb) return zero;
+
+  try {
+    const dayStart = new Date(Date.now() - 86400_000).toISOString();
+    const weekStart = new Date(Date.now() - 7 * 86400_000).toISOString();
+
+    const { data: earnedRows, error: e1 } = await sb
+      .from("worker_earnings")
+      .select("earning_credits, created_at")
+      .eq("worker_wallet", wallet);
+    if (e1) throw e1;
+
+    const { data: paidRows, error: e2 } = await sb
+      .from("worker_payouts")
+      .select("amount_credits, status")
+      .eq("worker_wallet", wallet)
+      .in("status", ["completed", "pending_transfer"]);
+    if (e2) throw e2;
+
+    const totalEarned = (earnedRows ?? []).reduce((s, r) => s + Number(r.earning_credits), 0);
+    const totalPaid = (paidRows ?? []).reduce((s, r) => s + Number(r.amount_credits), 0);
+    const today = (earnedRows ?? [])
+      .filter((r) => String(r.created_at) >= dayStart)
+      .reduce((s, r) => s + Number(r.earning_credits), 0);
+    const week = (earnedRows ?? [])
+      .filter((r) => String(r.created_at) >= weekStart)
+      .reduce((s, r) => s + Number(r.earning_credits), 0);
+    const pending = Math.max(0, totalEarned - totalPaid);
+
+    return {
+      worker_wallet: wallet,
+      pending_credits: Math.round(pending * 10000) / 10000,
+      pending_sol: creditsToSol(pending),
+      total_earned_credits: Math.round(totalEarned * 10000) / 10000,
+      total_paid_credits: Math.round(totalPaid * 10000) / 10000,
+      today_credits: Math.round(today * 10000) / 10000,
+      week_credits: Math.round(week * 10000) / 10000,
+      payouts_enabled: config.workerPayoutsEnabled && isTreasuryPayoutConfigured(),
+      min_withdrawal_credits: config.workerMinWithdrawalCredits,
+      min_withdrawal_sol: creditsToSol(config.workerMinWithdrawalCredits),
+    };
+  } catch (error) {
+    console.log(`[supabase] worker_earnings_summary failed: ${formatSupabaseError(error)}`);
+    return zero;
+  }
+}
+
+export async function dbCreateWorkerPayout(row: {
+  worker_wallet: string;
+  amount_credits: number;
+  amount_lamports: bigint;
+  dest_address: string;
+}): Promise<
+  | { ok: true; payoutId: string }
+  | { ok: false; reason: "below_min" | "insufficient" | "in_flight" }
+> {
+  const sb = getClient();
+  if (!sb) return { ok: false, reason: "insufficient" };
+
+  try {
+    const { data: inflight } = await sb
+      .from("worker_payouts")
+      .select("id")
+      .eq("worker_wallet", row.worker_wallet)
+      .eq("status", "pending_transfer")
+      .maybeSingle();
+    if (inflight) return { ok: false, reason: "in_flight" };
+
+    const summary = await dbGetWorkerEarningsSummary(row.worker_wallet);
+    if (summary.pending_credits < row.amount_credits) {
+      return { ok: false, reason: "insufficient" };
+    }
+
+    const id = crypto.randomUUID();
+    const { error } = await sb.from("worker_payouts").insert({
+      id,
+      worker_wallet: row.worker_wallet,
+      amount_credits: row.amount_credits,
+      amount_lamports: Number(row.amount_lamports),
+      dest_address: row.dest_address,
+      status: "pending_transfer",
+    });
+    if (error) throw error;
+    return { ok: true, payoutId: id };
+  } catch (error) {
+    console.log(`[supabase] create_worker_payout failed: ${formatSupabaseError(error)}`);
+    return { ok: false, reason: "insufficient" };
+  }
+}
+
+export async function dbMarkWorkerPayoutCompleted(payoutId: string, txSignature: string): Promise<void> {
+  const sb = getClient();
+  if (!sb) return;
+  try {
+    const { error } = await sb
+      .from("worker_payouts")
+      .update({
+        status: "completed",
+        tx_signature: txSignature,
+        completed_at: new Date().toISOString(),
+      })
+      .eq("id", payoutId)
+      .eq("status", "pending_transfer");
+    if (error) throw error;
+  } catch (error) {
+    console.log(`[supabase] mark_worker_payout_completed failed: ${formatSupabaseError(error)}`);
+  }
+}
+
+export async function dbMarkWorkerPayoutFailed(payoutId: string): Promise<void> {
+  const sb = getClient();
+  if (!sb) return;
+  try {
+    const { error } = await sb
+      .from("worker_payouts")
+      .update({
+        status: "failed",
+        completed_at: new Date().toISOString(),
+      })
+      .eq("id", payoutId)
+      .eq("status", "pending_transfer");
+    if (error) throw error;
+  } catch (error) {
+    console.log(`[supabase] mark_worker_payout_failed: ${formatSupabaseError(error)}`);
+  }
+}
+
+export async function dbListWorkerPayouts(
+  wallet: string,
+  limit: number,
+): Promise<
+  Array<{
+    id: string;
+    amount_credits: number;
+    amount_sol: number;
+    dest_address: string;
+    status: string;
+    tx_signature: string | null;
+    created_at: string;
+    completed_at: string | null;
+  }>
+> {
+  const sb = getClient();
+  if (!sb) return [];
+  const { creditsToSol } = await import("./billing/pricing.js");
+  try {
+    const { data, error } = await sb
+      .from("worker_payouts")
+      .select("id, amount_credits, dest_address, status, tx_signature, created_at, completed_at")
+      .eq("worker_wallet", wallet)
+      .order("created_at", { ascending: false })
+      .limit(limit);
+    if (error) throw error;
+    return (data ?? []).map((r) => ({
+      id: String(r.id),
+      amount_credits: Number(r.amount_credits),
+      amount_sol: creditsToSol(Number(r.amount_credits)),
+      dest_address: String(r.dest_address),
+      status: String(r.status),
+      tx_signature: r.tx_signature ? String(r.tx_signature) : null,
+      created_at: String(r.created_at),
+      completed_at: r.completed_at ? String(r.completed_at) : null,
+    }));
+  } catch (error) {
+    console.log(`[supabase] list_worker_payouts failed: ${formatSupabaseError(error)}`);
+    return [];
+  }
+}

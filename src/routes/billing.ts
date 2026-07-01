@@ -8,6 +8,8 @@ import {
 } from "../billing/aggregate.js";
 import { creditFromOnChainDeposit, getCreditBalance, topupCredits } from "../billing/credits.js";
 import { buildDepositInfo, verifyDepositTransaction } from "../billing/deposits.js";
+import { creditUnitLabel } from "../billing/pricing.js";
+import { verifySolDepositTransaction } from "../billing/sol-deposits.js";
 import { closeInvoicesForAllWallets, closeInvoicesForWallet } from "../billing/invoice-cron.js";
 import { solscanTxUrl, syncInvoicesForWallet } from "../billing/invoices.js";
 import { config } from "../config.js";
@@ -89,7 +91,11 @@ billingRoutes.get("/v1/billing/deposit/info", async (c) => {
 
   const info = buildDepositInfo(auth.wallet);
   if (!info) {
-    return c.json({ error: "Deposit not configured (LOCK_MINT / TREASURY)" }, 503);
+    const hint =
+      config.billingRail === "sol"
+        ? "Deposit not configured (TREASURY)"
+        : "Deposit not configured (LOCK_MINT / TREASURY)";
+    return c.json({ error: hint }, 503);
   }
   return c.json(info);
 });
@@ -104,6 +110,39 @@ billingRoutes.post("/v1/billing/deposit/confirm", async (c) => {
 
   if (await dbGetDepositByTx(txSignature)) {
     return c.json({ error: "Deposit already credited", code: "duplicate_deposit" }, 409);
+  }
+
+  if (config.billingRail === "sol") {
+    const verified = await verifySolDepositTransaction(txSignature, auth.wallet);
+    if ("error" in verified) {
+      return c.json({ error: verified.error }, 400);
+    }
+
+    const inserted = await dbInsertDeposit({
+      tx_signature: txSignature,
+      owner_wallet: auth.wallet,
+      amount_lock: verified.credits,
+      deposit_vault: verified.vault,
+    });
+    if (!inserted) {
+      return c.json({ error: "Deposit already credited", code: "duplicate_deposit" }, 409);
+    }
+
+    const balance = await creditFromOnChainDeposit(
+      auth.wallet,
+      verified.credits,
+      txSignature,
+    );
+
+    return c.json({
+      ok: true,
+      rail: "sol",
+      credited: verified.credits,
+      credited_lamports: verified.lamports,
+      balance_lock: balance,
+      credit_unit: creditUnitLabel(),
+      explorer_url: solscanTxUrl(txSignature),
+    });
   }
 
   const verified = await verifyDepositTransaction(txSignature, auth.wallet);
@@ -129,8 +168,10 @@ billingRoutes.post("/v1/billing/deposit/confirm", async (c) => {
 
   return c.json({
     ok: true,
+    rail: "lock",
     credited: verified.amountLock,
     balance_lock: balance,
+    credit_unit: creditUnitLabel(),
     explorer_url: solscanTxUrl(txSignature),
   });
 });

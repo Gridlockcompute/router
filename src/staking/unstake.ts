@@ -4,7 +4,7 @@ import {
   dbInsertUnstakeRequest,
   dbMarkUnstakeClaimed,
 } from "../db.js";
-import { buildStakePosition, readLockTokenBalance } from "./reads.js";
+import { buildStakePosition, readTokenBalance } from "./reads.js";
 
 export interface PendingUnstake {
   id: string;
@@ -74,9 +74,9 @@ export async function completeUnstakeClaim(
   const vaultAta = (await buildStakePosition(wallet)).staker_vault_ata;
   if (!vaultAta) return { error: "Staker vault not configured" };
 
-  const before = await readLockTokenBalance(vaultAta);
+  const before = await readTokenBalance(vaultAta);
   await new Promise((r) => setTimeout(r, 1500));
-  const after = await readLockTokenBalance(vaultAta);
+  const after = await readTokenBalance(vaultAta);
 
   const withdrawn = before.balance_lock - after.balance_lock;
   if (withdrawn + 0.0001 < pending.amount_lock) {

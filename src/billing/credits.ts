@@ -1,4 +1,5 @@
 import { config } from "../config.js";
+import { creditUnitLabel } from "./pricing.js";
 import {
   dbApplyCredit,
   dbChargeCustomer,
@@ -140,8 +141,9 @@ export async function creditFromOnChainDeposit(
 }
 
 export function insufficientCreditsResponse(balance: number, fee: number) {
+  const unit = creditUnitLabel();
   return {
-    error: `Insufficient $LOCK credit balance (${balance.toFixed(4)} available, ${fee.toFixed(4)} required)`,
+    error: `Insufficient ${unit} balance (${balance.toFixed(4)} available, ${fee.toFixed(4)} required)`,
     code: "insufficient_credits" as const,
     balance_lock: balance,
     fee_lock: fee,
